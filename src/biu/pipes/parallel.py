@@ -6,7 +6,7 @@ __all__ = ['parallel']
 def parallel(mp, **kwargs):
     def wrapper(s: Stream):
         if s.is_value:
-            return unwrap(mp, s.value)
+            return unwrap(mp, s.item)
 
         from concurrent.futures import ThreadPoolExecutor
 

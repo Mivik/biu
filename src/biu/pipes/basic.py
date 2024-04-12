@@ -1,7 +1,18 @@
 from collections import deque
 from rich import print
 
-from ..main import unwrap, pipe, Stream, Record, FieldSet, get_field, Value
+from ..main import (
+    unwrap,
+    pipe,
+    Stream,
+    Record,
+    FieldSet,
+    get_field,
+    Value,
+    Map,
+)
+
+from typing import overload
 
 __all__ = [
     'echo',
@@ -15,11 +26,12 @@ __all__ = [
     'each',
     'eachi',
     'pretty',
-    'wait',
+    'block',
     'tee',
     'first',
     'last',
     'flatten',
+    'count',
 ]
 
 
@@ -114,13 +126,13 @@ def pretty(s: Stream):
     return s
 
 
-def wait(s: Stream):
+def block(s: Stream):
     ls = list(iter(s))
     return s.update(ls, len=len(ls))
 
 
 def tee(s: Stream):
-    s = s | wait
+    s = s | block
     print(s)
     return s
 
@@ -135,4 +147,19 @@ def last(s: Stream):
 
 def flatten(s: Stream):
     it = iter(s)
-    return s.update((y for x in it for y in x), len=None, fields=None)
+    return s.update(iter=(y for x in it for y in x), len=None, fields=None)
+
+
+@overload
+def count(s: Stream): ...
+@overload
+def count(mp: Map): ...
+
+
+def count(x):
+    if isinstance(x, Stream):
+        return x.update(value=sum(1 for _ in iter(x)), fields=None)
+    elif isinstance(x, Map):
+        return Map(lambda v: len(unwrap(x, v)))
+    else:
+        raise TypeError('count expects a stream or a map')

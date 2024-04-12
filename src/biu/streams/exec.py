@@ -25,7 +25,7 @@ def wrap(
 ):
     input = None
     if s.is_value:
-        input = s.value
+        input = s.item
         if input is not None and not (
             isinstance(input, str) or isinstance(input, bytes)
         ):
@@ -64,7 +64,7 @@ def wrap(
         )
 
     if detailed:
-        return Stream(
+        return s.update(
             value=CallOutput(
                 stdout=out.decode(),
                 stderr=err.decode(),
@@ -73,7 +73,7 @@ def wrap(
             fields=CallOutput,
         )
     else:
-        return Stream(value=out.decode())
+        return s.update(value=out.decode(), fields=None)
 
 
 @pipe

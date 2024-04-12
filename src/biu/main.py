@@ -1,5 +1,6 @@
 import functools
 
+from dataclasses import dataclass
 from pydantic import BaseModel
 from rich.pretty import Pretty
 
@@ -10,6 +11,7 @@ from typing import (
     Optional,
     TypeVar,
     Union,
+    overload,
 )
 
 T = TypeVar('T')
@@ -52,10 +54,17 @@ def get_field(x, name):
     return x[name]
 
 
-def _fields(fields):
+def _to_fields(fields):
+    if fields is None:
+        return None
+
+    if isinstance(fields, FieldSet):
+        return fields
+
     if isinstance(fields, type) and issubclass(fields, BaseModel):
-        return fields.model_fields.keys()
-    return fields
+        return FieldSet(fields.model_fields.keys())
+
+    return FieldSet(fields)
 
 
 class FieldSet:
@@ -74,7 +83,7 @@ class FieldSet:
 
 class Record(dict):
     def __init__(self, arg, fields=None):
-        fields = _fields(fields)
+        fields = _to_fields(fields)
 
         if isinstance(arg, BaseModel):
             arg = arg.model_dump()
@@ -89,23 +98,27 @@ class Record(dict):
         self.__dict__ = self
 
 
-class Sink:
+class StreamOp:
+    pass
+
+
+class Sink(StreamOp):
     def __init__(self, value):
         self.value = value
 
 
-class Value:
+class Value(StreamOp):
     def __init__(self, value):
         self.value = value
 
 
-class alter_stream:
-    def __init__(self, value, updates):
+class alter_stream(StreamOp):
+    def __init__(self, value, **updates):
         self.value = value
         self.updates = updates
 
 
-class chain:
+class chain(StreamOp):
     def __init__(self, value, chain):
         self.value = value
         self.chain = chain
@@ -117,64 +130,103 @@ def sink(iter):
 
 
 class Stream(Generic[T]):
-    value: Iterator[T] = None
-    is_value: bool = True
-    is_table: bool = False
-    fields: Optional[FieldSet] = None
-    pretty: bool = False
-    len: Optional[int] = None
+    EMPTY: 'Stream'
 
-    def __init__(self, iter: Iterator[T] = None, **kwargs):
-        self.update(iter, **kwargs)
+    item: Any
+    is_value: bool
+    is_table: bool
+    pretty: bool
+    len: Optional[int]
+
+    @property
+    def fields(self):
+        return self._fields
+
+    @fields.setter
+    def fields(self, fields):
+        self._fields = _to_fields(fields)
+
+    def __init__(
+        self,
+        item: Any,
+        is_value=False,
+        is_table=False,
+        fields: Optional[Any] = None,
+        pretty=False,
+        len=None,
+    ):
+        self.item = item
+        self.is_value = is_value
+        self.is_table = is_table
+        self.fields = fields
+        self.pretty = pretty
+        self.len = len
+
+    def copy(self) -> 'Stream[T]':
+        return Stream(
+            self.item,
+            is_value=self.is_value,
+            is_table=self.is_table,
+            fields=self.fields,
+            pretty=self.pretty,
+            len=self.len,
+        )
 
     def update(
         self,
-        iter_or_value=None,
+        any: Optional[Any] = None,
+        /,
         iter: Iterator[T] = None,
         value: Optional[Any] = None,
         **kwargs,
     ) -> 'Stream[T]':
-        if iter_or_value is not None:
+        if any is not None:
+            if iter is not None or value is not None:
+                raise ValueError('only one of iter, value, or any can be used')
+
+            # TODO: why pylance says this is inaccessible?
             if self.is_value:
-                value = next(iter_or_value)
+                value = next(any)
                 try:
-                    next(iter_or_value)
+                    next(any)
                     raise ValueError(
                         'update() got multiple values while expecting one'
                     )
                 except StopIteration:
                     pass
             else:
-                iter = iter_or_value
+                iter = any
 
-        if iter:
-            self.value = iter
+        if value is not None and iter is not None:
+            raise ValueError('only one of iter or value can be used')
+
+        s = self.copy()
+        if iter is not None:
+            s.item = iter
             if hasattr(iter, '__len__'):
                 len = iter.__len__()
                 if len is not None:
-                    self.len = len
+                    s.len = len
 
-            self.is_value = False
+            s.is_value = False
 
-        if value is not None:
-            self.value = value
-            self.is_value = True
-            self.is_table = isinstance(value, Record)
+        elif value is not None:
+            s.item = value
+            s.is_value = True
+            s.is_table = isinstance(value, Record)
+            s.len = None
 
-        try:
-            fields = _fields(kwargs.pop('fields'))
-            self.fields = FieldSet(fields) if fields else None
-        except KeyError:
-            pass
+        if kwargs:
+            for key, value in kwargs.items():
+                setattr(s, key, value)
 
-        self.__dict__.update(kwargs)
-        return self
+        return s
 
     def __iter__(self) -> Iterator[T]:
         if self.is_value:
-            return iter((self.value,))
+            return iter((self.item,))
         else:
-            return iter(self.value)
+            return iter(self.item)
 
     def __len__(self):
         return 1 if self.is_value else self.len
@@ -186,7 +238,8 @@ class Stream(Generic[T]):
             resp = pipe(self)
 
         updates = None
-        if isinstance(resp, alter_stream):
+        while isinstance(resp, alter_stream):
+            resp.updates.update(updates or {})
             updates = resp.updates
             resp = resp.value
 
@@ -199,29 +252,27 @@ class Stream(Generic[T]):
             resp = Sink(resp)
 
         if isinstance(resp, Stream):
-            self.value = resp.value
-            self.is_value = resp.is_value
-            self.fields = resp.fields
-            self.pretty = resp.pretty
-            self.len = resp.len
-        elif isinstance(resp, Sink):
-            if next:
-                raise ValueError('chain after sink')
-            return resp.value
-        elif isinstance(resp, Value):
-            self.value = resp.value
-            self.is_value = True
+            s = resp
         else:
-            self.value = resp
-            self.is_value = not hasattr(resp, '__next__')
+            s = self.copy()
+            if isinstance(resp, Sink):
+                if next:
+                    raise ValueError('chain after sink')
+                return resp.value
+            elif isinstance(resp, Value):
+                s.item = resp.value
+                s.is_value = True
+            else:
+                s.item = resp
+                s.is_value = not hasattr(resp, '__next__')
 
         if updates:
-            self.update(**updates)
+            s = s.update(**updates)
 
         if next:
-            return self | next
+            return s | next
 
-        return self
+        return s
 
     def __rich__(self):
         from rich.table import Table
@@ -254,11 +305,14 @@ class Stream(Generic[T]):
         return table
 
 
+Stream.EMPTY = Stream(None, is_value=True)
+
+
 def get(s: Stream):
     if not s.is_value:
         raise ValueError('can only get on a single value')
 
-    return Sink(s.value)
+    return Sink(s.item)
 
 
 class Map:
@@ -391,52 +445,67 @@ class Map:
 
     def __pipe__(self, stream: Stream) -> Stream:
         f = object.__getattribute__(self, 'f')
-        if stream.is_value:
-            return Stream(value=f(stream.value))
-        else:
-            return Stream(f(x) for x in stream)
+        return stream.update((f(x) for x in stream), fields=None)
 
 
 it = Map()
 
 
-class PipeWrapper:
-    def __init__(self, f, fields=None, input=True, sink=False, value=False):
-        if sink and value:
+@dataclass
+class PipeOptions:
+    fields: Optional[Any] = None
+    input: bool = True
+    sink: bool = False
+    value: bool = False
+
+    def __post_init__(self):
+        if self.sink and self.value:
             raise ValueError('sink and value are mutually exclusive')
 
+
+class PipeWrapper:
+    def __init__(self, f, options: PipeOptions):
         self.f = f
-        self.fields = fields
-        self.input = input
-        self.sink = sink
-        self.value = value
+        self.options = options
 
     def __call__(self, *args, **kwargs):
         return PipeWrapper(
-            lambda s, *args2, **kwargs2: self.f(
-                s, *args, *args2, **kwargs, **kwargs2
-            )
+            (
+                (
+                    lambda s, *args2, **kwargs2: self.f(
+                        s, *args, *args2, **kwargs, **kwargs2
+                    )
+                )
+                if self.options.input
+                else lambda *args2, **kwargs2: self.f(
+                    *args, *args2, **kwargs, **kwargs2
+                )
+            ),
+            self.options,
         )
 
     def __or__(self, pipe):
-        return Stream() | self | pipe
+        if isinstance(pipe, StreamHelper):
+            return pipe.__ror__(self)
+
+        return Stream.EMPTY | self | pipe
 
     def __pipe__(self, stream: Stream):
-        resp = self.f(stream) if self.input else self.f()
-        if self.sink:
+        resp = self.f(stream) if self.options.input else self.f()
+        if self.options.sink:
             return Sink(resp)
-        if self.value:
+        if self.options.value:
             return Value(resp)
 
-        if self.fields:
-            resp = chain(resp, table(self.fields))
+        if self.options.fields:
+            resp = chain(resp, table(self.options.fields))
 
         return resp
 
 
 def pipe(f=None, /, **kwargs):
     def wrapper(f, kwargs):
-        wrp = PipeWrapper(f, **kwargs)
+        wrp = PipeWrapper(f, PipeOptions(**kwargs))
         functools.update_wrapper(wrp, f)
         return wrp
 
@@ -446,12 +515,25 @@ def pipe(f=None, /, **kwargs):
         return wrapper(f, {})
 
 
-class stream:
+class StreamHelper:
     def __call__(self, iter: Iterator[T]) -> Stream[T]:
         return Stream[T](iter)
 
-    def __ror__(self, iter: Iterator[T]) -> Stream[T]:
-        return Stream[T](iter)
+    @overload
+    def __ror__(self, iter: Iterator[T]) -> Stream[T]: ...
+    @overload
+    def __ror__(self, wrapper: PipeWrapper) -> Stream[T]: ...
+
+    def __ror__(self, x):
+        if isinstance(x, StreamOp):
+            return Stream.EMPTY | (lambda _: x)
+        if isinstance(x, PipeWrapper):
+            return Stream.EMPTY | x
+
+        return Stream(x)
+
+
+stream = StreamHelper()
 
 
 @pipe
