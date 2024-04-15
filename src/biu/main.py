@@ -277,6 +277,9 @@ class Stream(Generic[T]):
     def __rich__(self):
         from rich.table import Table
 
+        if self.is_value:
+            return Pretty(self.item)
+
         table = Table()
 
         format = Pretty if self.pretty else str

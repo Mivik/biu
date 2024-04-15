@@ -32,6 +32,7 @@ __all__ = [
     'last',
     'flatten',
     'count',
+    'reverse',
 ]
 
 
@@ -163,3 +164,8 @@ def count(x):
         return Map(lambda v: len(unwrap(x, v)))
     else:
         raise TypeError('count expects a stream or a map')
+
+
+@pipe
+def reverse(s: Stream):
+    return s.update(reversed(list(iter(s))))
